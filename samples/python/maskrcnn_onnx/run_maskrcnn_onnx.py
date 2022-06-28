@@ -3,6 +3,7 @@ import logging
 import cv2
 import numpy as np
 import argparse
+import onnxruntime as ort
 from pyppl import nn as pplnn
 from pyppl import common as pplcommon
 
@@ -144,6 +145,7 @@ class PPLModel(object):
         cuda_options = pplnn.cuda.EngineOptions()
         cuda_options.device_id = 0
         cuda_engine = pplnn.cuda.EngineFactory.Create(cuda_options)
+        cuda_engine.Configure(pplnn.cuda.ENGINE_CONF_USE_DEFAULT_ALGORITHMS)
         self._engines.append(cuda_engine)
 
     def _create_runtime(self, model_file_name):
@@ -157,7 +159,7 @@ class PPLModel(object):
             logging.error("init OnnxRuntimeBuilder failed: " + pplcommon.GetRetCodeStr(status))
             sys.exit(-1)
 
-        resources = RuntimeBuilderResources()
+        resources = pplnn.onnx.RuntimeBuilderResources()
         resources.engines = self._engines
         status = runtime_builder.SetResources(resources)
         if status != pplcommon.RC_SUCCESS:
@@ -174,11 +176,11 @@ class PPLModel(object):
             logging.error("create Runtime instance failed.")
             sys.exit(-1)
 
-    def _prepare_input(self, input_file):
+    def _prepare_input(self, input_file, in_h, in_w):
         """  set input data
         """
         tensor = self._runtime.GetInputTensor(0)
-        in_data = np.fromfile(input_file, dtype=np.float32).reshape((1, 3, 800, 1200))
+        in_data = np.fromfile(input_file, dtype=np.float32).reshape((1, 3, in_h, in_w))
         status = tensor.ConvertFromHost(in_data)
         if status != pplcommon.RC_SUCCESS:
             logging.error("copy data to tensor[" + tensor.GetName() + "] failed: " +
@@ -205,7 +207,7 @@ class PPLModel(object):
                 masks_data = masks_data.squeeze()
         return dets_data, labels_data, masks_data
 
-    def run(self, engine_type, model_file_name, input_file):
+    def run(self, engine_type, model_file_name, input_file, in_h, in_w):
         """ run pplmodel
 
         Keyword arguments:
@@ -221,7 +223,7 @@ class PPLModel(object):
             logging.error('not support engine type: ', engine_type)
             sys.exit(-1)
         self._create_runtime(model_file_name)
-        self._prepare_input(input_file)
+        self._prepare_input(input_file, in_h, in_w)
         status = self._runtime.Run()
         if status != pplcommon.RC_SUCCESS:
             logging.error("Run() failed: " + pplcommon.GetRetCodeStr(status))
@@ -234,6 +236,9 @@ def parsArgs():
     parser.add_argument('-i', '--in_img_file', type=str, dest='in_img_file', required=True, help="Specify the input image.")
     parser.add_argument('-o', '--out_img_file', type=str, dest='out_img_file', required=False, help="Specify the output image's name.")
     parser.add_argument('-m', '--onnx_model', type=str, dest='onnx_model', required=True, help="Specify the onnx model path.")
+    parser.add_argument('-b', '--backend', type=str, dest='backend', required=True, help="Specify the backend to run.")
+    parser.add_argument('-d', '--device', type=str, dest='device', required=True, help="Specify the ppl device to run.")
+    parser.add_argument('--shape', type=int, nargs='+',dest='shape', default=[800,1200], required=True, help="img resize.")
 
     args = parser.parse_args()
 
@@ -258,13 +263,39 @@ if __name__ == "__main__":
     result_file = args.out_img_file
     model_file = args.onnx_model
 
+    in_h = args.shape[0]
+    in_w = args.shape[1]
+
     data_process = DataProcess()
     # preprocess
-    input_data = data_process.preprocess(image_file, 800, 1200)
+    input_data = data_process.preprocess(image_file, in_h, in_w)
 
     # runmodel
-    ppl_model = PPLModel()
-    dets_data, labels_data, masks_data = ppl_model.run('x86', model_file, input_data)
+    if (args.backend == 'ort'):
+        from mmcv.ops import get_onnxruntime_op_path
+        import os
+        ort_custom_op_path = get_onnxruntime_op_path()
+        assert os.path.exists(ort_custom_op_path)
+        session_options = ort.SessionOptions()
+        session_options.register_custom_ops_library(ort_custom_op_path)
+        session = ort.InferenceSession(model_file, session_options)
+        in_data = np.fromfile(input_data, dtype=np.float32).reshape((1, 3, in_h, in_w))
+        outname = [output.name for output in session.get_outputs()]
+        outputs = session.run([],{'input':in_data})
+        for i in range(len(outputs)):
+            outputs[i].tofile("test_outputs/" + outname[i] + ".dat")
+        dets_data, labels_data, masks_data = session.run([],{'input':in_data})
+        dets_data = dets_data[0]
+        labels_data = labels_data[0]
+        masks_data = masks_data[0]
+    elif args.backend == 'ppl':
+        ppl_model = PPLModel()
+        if args.device == "x86":
+            dets_data, labels_data, masks_data = ppl_model.run('x86', model_file, input_data, in_h, in_w)
+        elif args.device == "cuda":
+            dets_data, labels_data, masks_data = ppl_model.run('cuda', model_file, input_data, in_h, in_w)
+        else:
+            logging.error("device not support")
 
     # postprocess
     data_process.postprocess(dets_data, labels_data, masks_data, result_file)
